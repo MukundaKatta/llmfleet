@@ -16,7 +16,7 @@ import inspect
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 
 @dataclass
