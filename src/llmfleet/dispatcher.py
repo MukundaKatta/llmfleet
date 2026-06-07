@@ -247,7 +247,9 @@ class FleetDispatcher:
     async def _submit_batch(self, items: list[_PendingItem]) -> None:
         if not items:
             return
-        request_objs = [{"custom_id": it.request_id, "params": it.params} for it in items]
+        request_objs = [
+            {"custom_id": it.request_id, "params": it.params} for it in items
+        ]
         try:
             batch = await _maybe_await(
                 self.client.messages.batches.create, requests=request_objs
@@ -259,12 +261,22 @@ class FleetDispatcher:
             self.stats.errors += 1
             return
 
-        batch_id = getattr(batch, "id", None) or batch["id"]
+        batch_id = _extract(batch, "id")
+        if batch_id is None:
+            for it in items:
+                if not it.future.done():
+                    it.future.set_exception(RuntimeError("batch response missing id"))
+            self.stats.errors += 1
+            return
         self.stats.batches_submitted += 1
         if self.on_batch_submitted:
             try:
                 self.on_batch_submitted(
-                    PendingBatch(batch_id=batch_id, request_count=len(items), submitted_at=time.time())
+                    PendingBatch(
+                        batch_id=batch_id,
+                        request_count=len(items),
+                        submitted_at=time.time(),
+                    )
                 )
             except Exception:
                 pass
@@ -273,9 +285,7 @@ class FleetDispatcher:
         while True:
             await asyncio.sleep(self.policy.poll_interval_s)
             status = await _maybe_await(self.client.messages.batches.retrieve, batch_id)
-            ps = getattr(status, "processing_status", None) or (
-                status.get("processing_status") if isinstance(status, dict) else None
-            )
+            ps = _extract(status, "processing_status")
             if ps == "ended":
                 break
 
@@ -298,24 +308,42 @@ class FleetDispatcher:
                 )
 
     def _dispatch_result(self, items: list[_PendingItem], result: Any) -> None:
-        rid = getattr(result, "custom_id", None) or (
-            result.get("custom_id") if isinstance(result, dict) else None
-        )
+        rid = _extract(result, "custom_id")
         if rid is None:
             return
         for it in items:
             if it.request_id == rid and not it.future.done():
-                err = getattr(result, "error", None) or (
-                    result.get("error") if isinstance(result, dict) else None
-                )
+                err = _extract(result, "error")
                 if err:
                     it.future.set_exception(RuntimeError(str(err)))
                 else:
-                    payload = getattr(result, "result", None) or (
-                        result.get("result") if isinstance(result, dict) else result
-                    )
+                    payload = _extract(result, "result", default=_MISSING)
+                    if payload is _MISSING:
+                        # No "result" field at all: hand back the raw result so
+                        # callers can inspect whatever shape the provider used.
+                        payload = result
                     it.future.set_result(payload)
                 return
+
+
+_MISSING = object()  # sentinel: distinguishes "field absent" from a falsy value
+
+
+def _extract(obj: Any, key: str, default: Any = None) -> Any:
+    """Read `key` from an attribute-style object or a mapping.
+
+    Returns `default` only when the field is genuinely absent. Falsy values
+    that are actually present (``{}``, ``""``, ``0``, ``False``) are preserved
+    rather than being collapsed into the default — which a naive
+    ``getattr(...) or obj.get(...)`` chain would silently drop.
+    """
+    sentinel = object()
+    val = getattr(obj, key, sentinel)
+    if val is not sentinel:
+        return val
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
 
 
 def _chunks(seq: list, n: int) -> Iterator[list]:

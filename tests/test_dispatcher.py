@@ -1,10 +1,11 @@
 import asyncio
 import pytest
 
-from llmfleet import FleetDispatcher, RoutingPolicy
+from llmfleet import DispatchStats, FleetDispatcher, RoutingPolicy
 
 
 # ---------------- Fake Anthropic-shaped client ----------------
+
 
 class FakeMessagesCreate:
     def __init__(self):
@@ -74,7 +75,9 @@ async def test_sync_routing_for_tight_latency():
     policy = RoutingPolicy(sync_max_latency_ms=5000, poll_interval_s=0.01)
     async with FleetDispatcher(client, policy=policy) as fleet:
         result = await fleet.submit(
-            latency_budget_ms=1000, model="m", messages=[{"role": "user", "content": "hi"}]
+            latency_budget_ms=1000,
+            model="m",
+            messages=[{"role": "user", "content": "hi"}],
         )
     assert result["id"] == "msg_1"
     assert fleet.stats.sync_calls == 1
@@ -96,7 +99,9 @@ async def test_batch_routing_for_loose_latency():
             model="m",
             messages=[{"role": "user", "content": "hi"}],
         )
-    assert result == {"echo": {"model": "m", "messages": [{"role": "user", "content": "hi"}]}}
+    assert result == {
+        "echo": {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    }
     assert fleet.stats.batched_calls == 1
     assert fleet.stats.batches_submitted == 1
 
@@ -145,7 +150,9 @@ async def test_concurrent_submissions_pool_into_one_batch():
 @pytest.mark.asyncio
 async def test_drain_on_close_flushes_pending():
     client = FakeAnthropic()
-    policy = RoutingPolicy(batch_window_ms=10_000, batch_min_size=99, poll_interval_s=0.01)
+    policy = RoutingPolicy(
+        batch_window_ms=10_000, batch_min_size=99, poll_interval_s=0.01
+    )
     fleet = FleetDispatcher(client, policy=policy)
     await fleet.__aenter__()
     fut = asyncio.ensure_future(
@@ -155,7 +162,9 @@ async def test_drain_on_close_flushes_pending():
     await asyncio.sleep(0.05)
     await fleet.close()
     result = await fut
-    assert result == {"echo": {"model": "m", "messages": [{"role": "user", "content": "x"}]}}
+    assert result == {
+        "echo": {"model": "m", "messages": [{"role": "user", "content": "x"}]}
+    }
 
 
 @pytest.mark.asyncio
@@ -169,3 +178,110 @@ async def test_on_batch_submitted_callback():
         await fleet.submit_batch(model="m", messages=[])
     assert len(seen) == 1
     assert seen[0].request_count == 1
+
+
+# ---------------- Object-shaped client with configurable result payload ----------------
+
+
+class _ObjResult:
+    """Attribute-style batch result, like the real Anthropic SDK returns."""
+
+    def __init__(self, custom_id, *, result=None, error=None):
+        self.custom_id = custom_id
+        self.result = result
+        self.error = error
+
+
+class _ObjBatches:
+    def __init__(self, payload_for):
+        # payload_for(custom_id) -> _ObjResult
+        self._payload_for = payload_for
+        self._requests = {}
+        self._counter = 0
+
+    async def create(self, *, requests):
+        self._counter += 1
+        bid = f"objbatch_{self._counter}"
+        self._requests[bid] = list(requests)
+
+        class B:
+            pass
+
+        b = B()
+        b.id = bid
+        return b
+
+    async def retrieve(self, batch_id):
+        # Attribute-style status object, again like the real SDK.
+        class S:
+            processing_status = "ended"
+
+        return S()
+
+    def results(self, batch_id):
+        return [self._payload_for(r["custom_id"]) for r in self._requests[batch_id]]
+
+
+def _make_obj_client(payload_for):
+    class M:
+        def __init__(self):
+            self.create = FakeMessagesCreate()
+            self.batches = _ObjBatches(payload_for)
+
+    class C:
+        def __init__(self):
+            self.messages = M()
+
+    return C()
+
+
+@pytest.mark.asyncio
+async def test_batch_result_with_falsy_payload_is_preserved():
+    # Regression: an empty-dict (falsy but valid) payload must reach the caller
+    # verbatim, not be swallowed and replaced by the raw wrapper object.
+    client = _make_obj_client(lambda cid: _ObjResult(cid, result={}))
+    policy = RoutingPolicy(batch_window_ms=30, poll_interval_s=0.001)
+    async with FleetDispatcher(client, policy=policy) as fleet:
+        result = await fleet.submit_batch(model="m", messages=[])
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_result_with_empty_string_payload_is_preserved():
+    client = _make_obj_client(lambda cid: _ObjResult(cid, result=""))
+    policy = RoutingPolicy(batch_window_ms=30, poll_interval_s=0.001)
+    async with FleetDispatcher(client, policy=policy) as fleet:
+        result = await fleet.submit_batch(model="m", messages=[])
+    assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_batch_result_error_propagates_as_exception():
+    client = _make_obj_client(lambda cid: _ObjResult(cid, error="rate_limited"))
+    policy = RoutingPolicy(batch_window_ms=30, poll_interval_s=0.001)
+    async with FleetDispatcher(client, policy=policy) as fleet:
+        with pytest.raises(RuntimeError, match="rate_limited"):
+            await fleet.submit_batch(model="m", messages=[])
+
+
+@pytest.mark.asyncio
+async def test_submit_after_close_raises():
+    client = FakeAnthropic()
+    fleet = FleetDispatcher(client, policy=RoutingPolicy(poll_interval_s=0.01))
+    await fleet.__aenter__()
+    await fleet.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await fleet.submit_sync(model="m", messages=[])
+
+
+def test_dispatch_stats_total():
+    stats = DispatchStats(sync_calls=2, batched_calls=5)
+    assert stats.total == 7
+
+
+def test_routing_policy_cost_aware_applies_overrides():
+    policy = RoutingPolicy.cost_aware(batch_window_ms=1234, batch_max_size=7)
+    assert policy.batch_window_ms == 1234
+    assert policy.batch_max_size == 7
+    # Untouched fields keep their defaults.
+    assert policy.sync_max_latency_ms == 5_000
